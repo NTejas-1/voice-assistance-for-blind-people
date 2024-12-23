@@ -1,17 +1,28 @@
+import math
 from ultralytics import YOLO
 import cv2
-import cvzone
-import math
+import subprocess
+import numpy as np
+import os
 import pyttsx3
 import pytesseract
-from cvzone.FaceMeshModule import FaceMeshDetector
-import numpy as np
+from PIL import Image
+import serial
+import time
 import face_recognition
-import os
 
-# creating a list of known persons
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+engine = pyttsx3.init()
+engine.setProperty('rate', 120)
 
-path = '../YOLO/knownPersons'
+serial_port = serial.Serial(
+    port="/dev/serial0",
+    baudrate=115200,
+    timeout=0.5
+)
+
+# Face recognition setup
+path = 'knownPersons'
 images = []
 classNamesKnown = []
 myList = os.listdir(path)
@@ -19,8 +30,6 @@ for cl in myList:
     curImg = cv2.imread(f'{path}/{cl}')
     images.append(curImg)
     classNamesKnown.append(os.path.splitext(cl)[0])
-
-# mandatory/formality encoding for module to work
 
 def findEncoding(images):
     encodeList = []
@@ -31,24 +40,59 @@ def findEncoding(images):
     return encodeList
 
 encodeListKnown = findEncoding(images)
+print(f"Number of known encodings: {len(encodeListKnown)}")
 
-# capturing frame in real time
+# Frame capture function
+def capture_frame():
+    libcamera_process = subprocess.Popen(
+        [
+            'libcamera-vid', '--inline', '--framerate', '30', '--width', '640', '--height', '480',
+            '--codec', 'mjpeg', '-o', '-'
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
+    )
 
-cap = cv2.VideoCapture(1)
-cap.set(3, 1280)
-cap.set(4, 720)
+    print("Capturing frame and saving to the specified path...")
 
-# setting max numbers of face required to detect(more face leads to slow processing)
+    mjpeg_stream = b""
+    saved_frame = None
 
-detector = FaceMeshDetector(maxFaces=1)
+    try:
+        while True:
+            chunk = libcamera_process.stdout.read(4096)
+            mjpeg_stream += chunk
 
-# cap = cv2.VideoCapture("../videos/cars.mp4")
+            start_idx = mjpeg_stream.find(b'\xff\xd8')
+            end_idx = mjpeg_stream.find(b'\xff\xd9')
 
-model = YOLO('../yolo-weights/yolov8n.pt')
+            if start_idx != -1 and end_idx != -1:
+                frame_data = mjpeg_stream[start_idx:end_idx + 2]
+                mjpeg_stream = mjpeg_stream[end_idx + 2:]
 
-# coco data set configration class
+                frame = cv2.imdecode(np.frombuffer(frame_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    frame = cv2.rotate(frame, cv2.ROTATE_180)
+                    saved_frame = frame
+                    break
 
-classNames = [
+    except KeyboardInterrupt:
+        print("\nProgram interrupted manually.")
+    finally:
+        libcamera_process.terminate()
+
+        if saved_frame is not None:
+            output_dir = os.path.abspath("./test_image")
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, "captured_frame.jpg")
+            cv2.imwrite(output_path, saved_frame)
+            print(f"Frame saved at {output_path}")
+        else:
+            print("No frame was captured.")
+
+def run_object_detection():
+    model = YOLO('../YOLO-Weights/yolov8n.pt')
+    classNames = [
               "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat", "traffic light",
               "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
               "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "hand bag", "tie", "suitcase", "frisbee",
@@ -60,78 +104,83 @@ classNames = [
               "teddy bear", "hair drier", "tooth brush"
               ]
 
-while True:
-    success, img = cap.read()
-    img, faces = detector.findFaceMesh(img, draw=False)
-    results = model(img, stream=True)
-
-    # identification of known persons
-
-    imgS = cv2.resize(img, (0, 0), None, 0.25, 0.25)
-    imgS = cv2.cvtColor(imgS, cv2.COLOR_BGR2RGB)
-
-    facesCurFrame = face_recognition.face_locations(imgS)
-    encodesCurFrame = face_recognition.face_encodings(imgS, facesCurFrame)
-    name = ''
-
-    for encodeFace, faceLoc in zip(encodesCurFrame, facesCurFrame):
-        matches = face_recognition.compare_faces(encodeListKnown, encodeFace)
-        faceDis = face_recognition.face_distance(encodeListKnown, encodeFace)
-        # print(faceDis)
-        matchIndex = np.argmin(faceDis)
-
-        if matches[matchIndex]:
-            name = classNamesKnown[matchIndex].upper()
-            y1, x2, y2, x1 = faceLoc
-            y1, x2, y2, x1 = y1 * 4, x2 * 4, y2 * 4, x1 * 4
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.rectangle(img, (x1, y2 - 35), (x2, y2), (0, 255, 0), cv2.FILLED)
-            cv2.putText(img, name, (x1 + 6, y2 - 6), cv2.FONT_HERSHEY_PLAIN, 1, (255, 255, 255), 2)
-
-    # putting box around detected object
-
-    for r in results:
+    result = model('test_image/captured_frame.jpg', show=True)
+    for r in result:
         boxes = r.boxes
         for box in boxes:
-            x1, y1, x2, y2 = box.xyxy[0]
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-
-            w, h = x2-x1, y2-y1
-            cvzone.cornerRect(img, (x1, y1, w, h))
-
             conf = math.ceil((box.conf[0]*100))/100
-
             cls = int(box.cls[0])
-            # displaying the detected object's text on image
+            text = f'{classNames[cls]} {conf}'
+            text_to_voice(text)
 
-            cvzone.putTextRect(img, f'{classNames[cls]} {conf}', (max(0, x1), max(35, y1)), scale=1, thickness=1)
+def run_face_recognition():
+    cap = cv2.VideoCapture(0)
 
-            # finding the distance of the person
-            if faces:
-                face = faces[0]
-                PointLeft = face[145]
-                PointRight = face[374]
-                # cv2.line(img, PointLeft, PointRight, (0, 200, 0), 2)
-                # cv2.circle(img, PointLeft, 5, (255, 0, 255), cv2.FILLED)
-                # cv2.circle(img, PointRight, 5, (255, 0, 255), cv2.FILLED)
-                w, _ = detector.findDistance(PointLeft, PointRight)
-                W = 6.3
-                f = 840
-                d = ((W * f) / w)
-                # print(d)
-                cvzone.putTextRect(img, f'distance: {int(d)}centimeters', (face[10][0] - 125, face[10][1] - 45), scale=2)
-            else:
-                d = "0"
+    while True:
+        success, img = cap.read()
+        if not success:
+            print("Failed to read from camera.")
+            break
 
-            # voice feedback of all the stuff detected
+        imgS = cv2.resize(img, (0, 0), None, 0.25, 0.25)
+        imgS = cv2.cvtColor(imgS, cv2.COLOR_BGR2RGB)
 
-            text = f'{classNames[cls]} {conf}, person distance: {int(d)}centimeters', f'{name}'
+        facesCurFrame = face_recognition.face_locations(imgS)
+        encodesCurFrame = face_recognition.face_encodings(imgS, facesCurFrame)
 
-            engine = pyttsx3.init()
-            engine.setProperty('rate', 150)
-            pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-            engine.say(text)
+        for encodeFace, faceLoc in zip(encodesCurFrame, facesCurFrame):
+            matches = face_recognition.compare_faces(encodeListKnown, encodeFace)
+            faceDis = face_recognition.face_distance(encodeListKnown, encodeFace)
+
+            matchIndex = np.argmin(faceDis)
+            if matches[matchIndex]:
+                name = classNamesKnown[matchIndex].upper()
+                y1, x2, y2, x1 = faceLoc
+                y1, x2, y2, x1 = y1 * 4, x2 * 4, y2 * 4, x1 * 4
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.rectangle(img, (x1, y2 - 35), (x2, y2), (0, 255, 0), cv2.FILLED)
+                cv2.putText(img, name, (x1 + 6, y2 - 6), cv2.FONT_HERSHEY_PLAIN, 1, (255, 255, 255), 2)
+                text_to_voice(f"Recognized {name}")
+
+        cv2.imshow("Face Recognition", img)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+def read_tfluna_data():
+    if serial_port.in_waiting >= 9:
+        data = serial_port.read(9)
+        if data[0] == 0x59 and data[1] == 0x59:
+            distance = data[2] + (data[3] << 8)
+            strength = data[4] + (data[5] << 8)
+            temperature = data[6] + (data[7] << 8)
+            print(distance)
+            text_to_voice(f'Object at {distance} centimeters')
+    time.sleep(0.5)
+    serial_port.reset_input_buffer()
+    time.sleep(0.5)
+
+def text_to_voice(text):
+    lines = text.split("\n")
+    for line in lines:
+        if line.strip():
+            engine.say(line)
             engine.runAndWait()
 
-    cv2.imshow("Image", img)
-    cv2.waitKey(1)
+opt = input(" press \n 1 for object detection with face recognition and LiDAR \n 2 for text extraction")
+
+capture_frame()
+
+if opt == '1':
+    run_object_detection()
+    run_face_recognition()
+    read_tfluna_data()
+    cv2.waitKey(0)
+
+elif opt == '2':
+    extract_text(r'test_image/captured_frame.jpg', "eng")
+
+else:
+    text_to_voice("Select a valid option")
